@@ -47,6 +47,7 @@ import logging
 import random
 import re
 import time
+import threading
 
 logger = logging.getLogger('schedule')
 
@@ -81,6 +82,7 @@ class Scheduler(object):
     """
     def __init__(self):
         self.jobs = []
+        self.lock = threading.RLock()
 
     def run_pending(self):
         """
@@ -92,9 +94,10 @@ class Scheduler(object):
         in one hour increments then your job won't be run 60 times in
         between but only once.
         """
-        runnable_jobs = (job for job in self.jobs if job.should_run)
-        for job in sorted(runnable_jobs):
-            self._run_job(job)
+        with self.lock:
+          runnable_jobs = (job for job in self.jobs if job.should_run)
+          for job in sorted(runnable_jobs):
+              self._run_job(job)
 
     def run_all(self, delay_seconds=0):
         """
@@ -106,11 +109,12 @@ class Scheduler(object):
 
         :param delay_seconds: A delay added between every executed job
         """
-        logger.info('Running *all* %i jobs with %is delay inbetween',
-                    len(self.jobs), delay_seconds)
-        for job in self.jobs[:]:
-            self._run_job(job)
-            time.sleep(delay_seconds)
+        with self.lock:
+          logger.info('Running *all* %i jobs with %is delay inbetween',
+                      len(self.jobs), delay_seconds)
+          for job in self.jobs[:]:
+              self._run_job(job)
+              time.sleep(delay_seconds)
 
     def clear(self, tag=None):
         """
@@ -120,10 +124,11 @@ class Scheduler(object):
         :param tag: An identifier used to identify a subset of
                     jobs to delete
         """
-        if tag is None:
-            del self.jobs[:]
-        else:
-            self.jobs[:] = (job for job in self.jobs if tag not in job.tags)
+        with self.lock:
+          if tag is None:
+              del self.jobs[:]
+          else:
+              self.jobs[:] = (job for job in self.jobs if tag not in job.tags)
 
     def cancel_job(self, job):
         """
@@ -131,10 +136,42 @@ class Scheduler(object):
 
         :param job: The job to be unscheduled
         """
-        try:
-            self.jobs.remove(job)
-        except ValueError:
-            pass
+        with self.lock:
+          try:
+              self.jobs.remove(job)
+          except ValueError:
+              pass
+
+    # threaded add_job
+    def add_job(self, job):
+        """
+        Add a scheduled job.
+
+        :param job: The job to be scheduled
+        """
+        add_thread = threading.Thread(
+          target=self._add_job, 
+          args=[job]
+        )
+        add_thread.start()
+
+
+    def _add_job(self, job):
+       with self.lock:
+          try:
+              self.jobs.append(job)
+          except ValueError:
+              pass
+
+    def once(self):
+        """
+        Schedule a new periodic job.
+
+        :param interval: A quantity of a certain time unit
+        :return: An unconfigured :class:`Job <Job>`
+        """
+        job = RunOnceJob(0, self)
+        return job
 
     def every(self, interval=1):
         """
@@ -465,7 +502,7 @@ class Job(object):
             # call will fail.
             pass
         self._schedule_next_run()
-        self.scheduler.jobs.append(self)
+        self.scheduler.add_job(self)
         return self
 
     @property
@@ -558,6 +595,25 @@ class Job(object):
                 self.next_run -= self.period
 
 
+class RunOnceJob(Job):
+    def run(self):
+        """
+        Run the job and cancel.
+
+        """
+        logger.info('Running job %s', self)
+        self.job_func()
+        return CancelJob
+
+    def _schedule_next_run(self):
+        """
+        Compute the instant when this job should run next.
+        """
+        self.next_run = datetime.datetime.now()
+ 
+ 
+
+
 # The following methods are shortcuts for not having to
 # create a Scheduler instance:
 
@@ -567,6 +623,8 @@ default_scheduler = Scheduler()
 #: Default :class:`Jobs <Job>` list
 jobs = default_scheduler.jobs  # todo: should this be a copy, e.g. jobs()?
 
+def once():
+    return default_scheduler.once()
 
 def every(interval=1):
     """Calls :meth:`every <Scheduler.every>` on the
